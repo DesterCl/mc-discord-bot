@@ -1,6 +1,11 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, ActivityType } = require('discord.js');
-const { joinVoiceChannel, getVoiceConnection } = require('@discordjs/voice');
+const {
+  joinVoiceChannel,
+  getVoiceConnection,
+  VoiceConnectionStatus,
+  entersState,
+} = require('@discordjs/voice');
 const { status, statusBedrock } = require('minecraft-server-util');
 
 const {
@@ -61,45 +66,66 @@ async function pingServer() {
 }
 
 // ----------------------------------------------------------------
-// Unirse / salir del canal de voz según el estado
+// Mantener al bot SIEMPRE conectado al canal de voz,
+// con reconexión automática si se cae la conexión.
 // ----------------------------------------------------------------
-async function updateVoicePresence(guild, isOnline) {
-  const existingConnection = getVoiceConnection(guild.id);
-
-  if (isOnline && !existingConnection) {
-    try {
-      joinVoiceChannel({
-        channelId: VOICE_CHANNEL_ID,
-        guildId: guild.id,
-        adapterCreator: guild.voiceAdapterCreator,
-        selfDeaf: true,
-        selfMute: true,
-      });
-      console.log('✅ Server online: bot unido al canal de voz.');
-    } catch (err) {
-      console.error('Error al unirse al canal de voz:', err);
-    }
-  } else if (!isOnline && existingConnection) {
-    existingConnection.destroy();
-    console.log('❌ Server offline: bot salió del canal de voz.');
+function connectToVoiceChannel(guild) {
+  const existing = getVoiceConnection(guild.id);
+  if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) {
+    return existing; // ya conectado, no hacer nada
   }
+
+  const connection = joinVoiceChannel({
+    channelId: VOICE_CHANNEL_ID,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: true,
+    selfMute: true,
+  });
+
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    console.log('⚠️ Conexión de voz perdida, intentando reconectar...');
+    try {
+      // Discord a veces solo re-negocia la conexión; le damos una oportunidad.
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+      ]);
+    } catch {
+      // No se recuperó sola: destruimos y reconectamos desde cero.
+      connection.destroy();
+      setTimeout(() => connectToVoiceChannel(guild), 5000);
+    }
+  });
+
+  connection.on(VoiceConnectionStatus.Destroyed, () => {
+    console.log('🔌 Conexión de voz destruida, reconectando en 5s...');
+    setTimeout(() => connectToVoiceChannel(guild), 5000);
+  });
+
+  connection.on('error', (err) => {
+    console.error('Error en la conexión de voz:', err);
+  });
+
+  console.log('🔊 Bot conectado al canal de voz.');
+  return connection;
 }
 
 // ----------------------------------------------------------------
-// Actualiza el estado ("Jugando X/Y jugadores")
+// Actualiza el estado del bot: 🟢 ONLINE / 🔴 OFFLINE + jugadores
 // ----------------------------------------------------------------
 async function updateBotStatus(data) {
   if (data.online) {
     client.user.setPresence({
       activities: [{
-        name: `${data.players}/${data.maxPlayers} jugadores`,
-        type: ActivityType.Playing,
+        name: `🟢 ONLINE (${data.players}/${data.maxPlayers})`,
+        type: ActivityType.Watching,
       }],
       status: 'online',
     });
   } else {
     client.user.setPresence({
-      activities: [{ name: 'Servidor offline', type: ActivityType.Watching }],
+      activities: [{ name: '🔴 OFFLINE', type: ActivityType.Watching }],
       status: 'idle',
     });
   }
@@ -116,20 +142,36 @@ async function checkLoop() {
   }
 
   await updateBotStatus(data);
-
-  const guild = client.guilds.cache.get(GUILD_ID);
-  if (guild) {
-    await updateVoicePresence(guild, data.online);
-  } else {
-    console.error('⚠️ No se encontró el GUILD_ID configurado. Revisa tu .env');
-  }
 }
 
 client.once('ready', () => {
   console.log(`🤖 Bot conectado como ${client.user.tag}`);
   printInviteLink();
+
+  const guild = client.guilds.cache.get(GUILD_ID);
+  if (guild) {
+    connectToVoiceChannel(guild);
+  } else {
+    console.error('⚠️ No se encontró el GUILD_ID configurado. Revisa tu .env');
+  }
+
   checkLoop(); // primera verificación inmediata
   setInterval(checkLoop, interval);
+});
+
+// Si el bot es desconectado del gateway de Discord, discord.js reconecta solo;
+// esto solo lo dejamos loggeado para que sea visible en pm2 logs.
+client.on('shardDisconnect', () => {
+  console.log('⚠️ Desconectado del gateway de Discord, reconectando...');
+});
+client.on('shardReconnecting', () => {
+  console.log('🔄 Reconectando al gateway de Discord...');
+});
+client.on('shardResume', () => {
+  console.log('✅ Reconexión al gateway de Discord exitosa.');
+});
+client.on('error', (err) => {
+  console.error('Error del cliente de Discord:', err);
 });
 
 client.login(DISCORD_TOKEN);
